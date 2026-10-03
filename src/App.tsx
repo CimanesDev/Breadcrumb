@@ -1,42 +1,88 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { ArrowLeft, ChevronRight, File, FolderOpen, Search, X } from 'lucide-react';
+import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
+import { ArrowLeft, ArrowUpRight, File, FolderOpen, Search, X } from 'lucide-react';
+import './style.css';
 
-type Record = {id:number;name:string;original_name:string;path:string;original_path:string;size_bytes:number;first_seen_at:string;last_seen_at:string;is_present:boolean;source_url:string|null;referrer_url:string|null;source_domain:string|null;browser_name:string|null;browser_profile:string|null;source_confidence:string|null};
-type Event = {event_type:string;at:string;old_path:string|null;new_path:string|null};
-type Source = {domain:string;file_count:number;total_bytes:number;latest_seen_at:string};
-type Activity = {file_id:number;name:string;source_domain:string|null;event_type:string;at:string;old_path:string|null;new_path:string|null};
-const date = (value:string) => new Date(value.replace(' ', 'T')+'Z').toLocaleString();
-const size = (value:number) => value < 1024 ? `${value} B` : value < 1048576 ? `${(value/1024).toFixed(1)} KB` : `${(value/1048576).toFixed(1)} MB`;
+type FileRecord = { id:number; name:string; original_name:string; path:string; original_path:string; size_bytes:number; first_seen_at:string; last_seen_at:string; is_present:boolean; source_url:string|null; referrer_url:string|null; source_domain:string|null; browser_name:string|null; browser_profile:string|null; source_confidence:string|null };
+type FileEvent = { event_type:string; at:string; old_path:string|null; new_path:string|null };
+type FileFacts = { created_at:number|null; modified_at:number|null; file_type:string; zone:string|null };
+
+const date = (value:string) => new Date(value.replace(' ', 'T') + 'Z').toLocaleString();
+const diskDate = (value:number|null) => value == null ? 'Unavailable' : new Date(value * 1000).toLocaleString();
+const size = (value:number) => value < 1024 ? `${value} B` : value < 1048576 ? `${(value/1024).toFixed(1)} KB` : value < 1073741824 ? `${(value/1048576).toFixed(1)} MB` : `${(value/1073741824).toFixed(1)} GB`;
+const title = (value:string) => value.replaceAll('_', ' ').toLowerCase().replace(/^./, letter => letter.toUpperCase());
 
 export default function App() {
-  const [files,setFiles] = useState<Record[]>([]);
-  const [query,setQuery] = useState('');
-  const [selected,setSelected] = useState<Record|null>(null);
-  const [events,setEvents] = useState<Event[]>([]);
-  const [sources,setSources] = useState<Source[]>([]);
-  const [activity,setActivity] = useState<Activity[]>([]);
-  const [view,setView] = useState<'files'|'sources'|'activity'>('files');
-  const [folders,setFolders] = useState<string[]>([]);
-  const [error,setError] = useState('');
-  const inspectPath = (path:string) => invoke<Record|null>('inspect_file',{path}).then(file=>{if(file){setSelected(file);setView('files');}else{setError('No history found for this file.');}}).catch(e=>setError(String(e)));
-  const refresh = () => { invoke<Record[]>('list_files',{query}).then(rows=>{setFiles(rows);setSelected(current=>current ? rows.find(row=>row.id===current.id) || current : null);}).catch(e=>setError(String(e))); invoke<Source[]>('list_sources').then(setSources).catch(e=>setError(String(e))); invoke<Activity[]>('recent_activity').then(setActivity).catch(e=>setError(String(e))); };
-  useEffect(()=>{let active=true;invoke<string|null>('take_pending_path').then(path=>{if(active&&path)inspectPath(path)}).catch(e=>setError(String(e)));const unlisten=listen<string>('inspect-path',event=>inspectPath(event.payload));return()=>{active=false;unlisten.then(fn=>fn());};},[]);
-  useEffect(()=>{ refresh(); },[query]);
-  useEffect(()=>{ invoke<string[]>('watched_folders').then(setFolders).catch(()=>{}); const unlisten=listen('history-changed',refresh); return ()=>{unlisten.then(fn=>fn());}; },[query]);
-  useEffect(()=>{ if(selected) invoke<Event[]>('file_events',{fileId:selected.id}).then(setEvents).catch(e=>setError(String(e))); },[selected]);
+  const [files, setFiles] = useState<FileRecord[]>([]);
+  const [query, setQuery] = useState('');
+  const [selected, setSelected] = useState<FileRecord|null>(null);
+  const [events, setEvents] = useState<FileEvent[]>([]);
+  const [facts, setFacts] = useState<FileFacts|null>(null);
+  const [error, setError] = useState('');
+
+  const inspectPath = useCallback((path:string) => {
+    invoke<FileRecord|null>('inspect_file', {path})
+      .then(file => file ? setSelected(file) : setError('No record found for this file.'))
+      .catch(reason => setError(String(reason)));
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    invoke<string|null>('take_pending_path').then(path => { if (active && path) inspectPath(path); }).catch(reason => setError(String(reason)));
+    const unlisten = listen<string>('inspect-path', event => inspectPath(event.payload));
+    return () => { active = false; unlisten.then(stop => stop()); };
+  }, [inspectPath]);
+
+  useEffect(() => {
+    invoke<FileRecord[]>('list_files', {query}).then(setFiles).catch(reason => setError(String(reason)));
+    const unlisten = listen('history-changed', () => invoke<FileRecord[]>('list_files', {query}).then(setFiles).catch(() => {}));
+    return () => { unlisten.then(stop => stop()); };
+  }, [query]);
+
+  useEffect(() => {
+    const window = getCurrentWindow();
+    window.setSize(new LogicalSize(selected ? 620 : 760, 720)).catch(() => {});
+    if (!selected) return;
+    invoke<FileEvent[]>('file_events', {fileId:selected.id}).then(setEvents).catch(reason => setError(String(reason)));
+    invoke<FileFacts>('file_facts', {path:selected.path}).then(setFacts).catch(reason => setError(String(reason)));
+  }, [selected]);
+
+  const openExplorer = () => selected && invoke('show_in_explorer', {path:selected.path}).catch(reason => setError(String(reason)));
+
   return <div className="app">
-    <header><div className="brand"><span className="brand-mark">● <i>•</i> <i>•</i> ›</span><strong>Breadcrumb</strong></div><nav><button className={view==='files'?'active':''} onClick={()=>{setSelected(null);setView('files')}}>Files</button><button className={view==='sources'?'active':''} onClick={()=>{setSelected(null);setView('sources')}}>Sources</button><button className={view==='activity'?'active':''} onClick={()=>{setSelected(null);setView('activity')}}>Activity</button></nav><span className="status"><span/> Watching {folders.length || 'your'} folders</span></header>
-    <main>
-      {selected ? <><button className="back" onClick={()=>setSelected(null)}><ArrowLeft size={17}/> Back to files</button><div className="detail-head"><div className="file-icon"><File size={28}/></div><div><h1>{selected.name}</h1><p>{selected.path}</p></div></div>
-        <div className="detail-grid"><section className="card origin"><label>ORIGIN</label><h2>{selected.source_domain || 'Source unknown'}</h2><p>{selected.source_url ? 'Downloaded from this address' : 'No source metadata was found for this file.'}</p>{selected.source_url && <div className="url">{selected.source_url}</div>}{selected.referrer_url && <p>Referrer: {selected.referrer_url}</p>}{selected.browser_name && <p>Browser: {selected.browser_name} · {selected.browser_profile}</p>}<small>{selected.source_confidence ? `${selected.source_confidence} confidence · ${selected.browser_name || 'Windows download metadata'}` : 'Breadcrumb will show a source only when evidence is available.'}</small></section>
-        <section className="card"><label>FILE</label><dl><dt>Original name</dt><dd>{selected.original_name}</dd><dt>Original location</dt><dd>{selected.original_path}</dd><dt>Current location</dt><dd>{selected.path}</dd><dt>Size</dt><dd>{size(selected.size_bytes)}</dd><dt>First seen</dt><dd>{date(selected.first_seen_at)}</dd><dt>Status</dt><dd>{selected.is_present ? 'On this computer' : 'Deleted or moved outside watched folders'}</dd></dl></section></div>
-        <section className="history"><label>HISTORY</label>{events.map((e,i)=><div className="history-row" key={i}><div className="history-dot"/><div><strong>{e.event_type.replace('_',' ').toLowerCase()}</strong><time>{date(e.at)}</time>{e.old_path && <p>From {e.old_path}</p>}{e.new_path && <p>To {e.new_path}</p>}</div></div>)}</section></>
-      : view==='sources' ? <><div className="hero"><span className="eyebrow">ORIGINS</span><h1>Sources</h1><p>The websites your tracked files came from.</p></div><div className="section-title"><span>KNOWN SOURCES</span><span>{sources.length} domains</span></div><div className="file-list">{sources.length ? sources.map(source=><button className="file-row" key={source.domain} onClick={()=>{setQuery(source.domain);setView('files')}}><span className="source-icon">{source.domain.slice(0,1).toUpperCase()}</span><span className="file-main"><strong>{source.domain}</strong><small>Latest file {date(source.latest_seen_at)}</small></span><span className="file-size">{source.file_count} files · {size(source.total_bytes)}</span><ChevronRight size={17}/></button>) : <div className="empty"><FolderOpen size={32}/><h3>No known sources yet</h3><p>Downloads with preserved origin information will appear here.</p></div>}</div></>
-      : view==='activity' ? <><div className="hero"><span className="eyebrow">RECENT EVENTS</span><h1>Activity</h1><p>A quiet record of what happened to your files.</p></div><div className="section-title"><span>HISTORY</span><span>{activity.length} events</span></div><div className="file-list">{activity.length ? activity.map((item,index)=><div className="file-row" key={`${item.file_id}-${item.at}-${index}`}><span className="file-icon"><File size={21}/></span><span className="file-main"><strong>{item.event_type.replaceAll('_',' ').toLowerCase()} · {item.name}</strong><small>{item.source_domain || item.new_path || item.old_path || 'Source unknown'}</small></span><span className="file-size">{date(item.at)}</span></div>) : <div className="empty"><FolderOpen size={32}/><h3>No activity yet</h3><p>File changes in watched folders will appear here.</p></div>}</div></>
-      : <><div className="hero"><span className="eyebrow">YOUR FILE HISTORY</span><h1>Every file leaves a trail.</h1><p>Find where your files came from and what happened to them.</p></div><div className="search"><Search size={20}/><input placeholder="Search files, folders, or websites..." value={query} onChange={e=>setQuery(e.target.value)}/>{query && <button onClick={()=>setQuery('')} aria-label="Clear"><X size={17}/></button>}</div>
-      <div className="section-title"><span>{query ? 'SEARCH RESULTS' : 'RECENT FILES'}</span><span>{files.length} files</span></div><div className="file-list">{files.length ? files.map(file=><button className="file-row" key={file.id} onClick={()=>setSelected(file)}><span className="file-icon"><File size={21}/></span><span className="file-main"><strong>{file.name}</strong><small>{file.source_domain || 'Source unknown'} · {date(file.first_seen_at)}</small></span><span className="file-size">{size(file.size_bytes)}</span><ChevronRight size={17}/></button>) : <div className="empty"><FolderOpen size={32}/><h3>{query?'No matching files':'Waiting for your first file'}</h3><p>{query?'Try a different filename or website.':`New files in ${folders.map(f=>f.split(/[\\/]/).pop()).join(', ') || 'your watched folders'} will appear here.`}</p></div>}</div></>}
-    </main><footer><span>Your file history stays on your computer. Breadcrumb does not upload your files or browsing history.</span><span>v0.1</span></footer>{error && <div className="error" onClick={()=>setError('')}>{error} <X size={14}/></div>}
+    <header className="topbar"><div className="brand"><span className="brand-mark">● · · ›</span><strong>Breadcrumb</strong></div><span className="topbar-label">File history</span></header>
+    <main className={selected ? 'inspector' : 'browser'}>
+      {selected ? <>
+        <div className="toolbar"><button className="text-button" onClick={() => {setSelected(null); setFacts(null);}}><ArrowLeft size={16}/> All files</button><button className="text-button" onClick={openExplorer}><FolderOpen size={16}/> Show in Explorer</button></div>
+        <div className="identity"><div className="identity-icon"><File size={27}/></div><div className="identity-text"><h1 title={selected.name}>{selected.name}</h1><p title={selected.path}>{selected.path}</p></div></div>
+        <div className="summary"><span className="summary-label">File trail</span><strong>{selected.source_domain ? `From ${selected.source_domain}` : facts?.zone === 'Internet' ? 'From the internet' : 'Origin unknown'}</strong><span>{selected.source_url ? 'Download address recorded' : facts?.zone === 'Internet' ? 'Windows marked this file as downloaded; its address was not saved.' : 'Breadcrumb first saw this file at the location below.'}</span></div>
+        <section className="panel"><h2>Origin</h2><dl>
+          <dt>First seen</dt><dd>{date(selected.first_seen_at)}</dd>
+          <dt>Original name</dt><dd>{selected.original_name}</dd>
+          <dt>Original location</dt><dd className="path-value">{selected.original_path}</dd>
+          {selected.source_url && <><dt>Download URL</dt><dd className="path-value">{selected.source_url}</dd></>}
+          {selected.referrer_url && <><dt>Referrer</dt><dd className="path-value">{selected.referrer_url}</dd></>}
+          {selected.browser_name && <><dt>Browser</dt><dd>{selected.browser_name}{selected.browser_profile ? ` · ${selected.browser_profile}` : ''}</dd></>}
+          {facts?.zone && <><dt>Windows zone</dt><dd>{facts.zone}</dd></>}
+        </dl></section>
+        <section className="panel"><h2>File details</h2><dl>
+          <dt>Current location</dt><dd className="path-value">{selected.path}</dd>
+          <dt>Type</dt><dd>{facts?.file_type ?? 'File'}</dd>
+          <dt>Size</dt><dd>{size(selected.size_bytes)}</dd>
+          <dt>Created on disk</dt><dd>{diskDate(facts?.created_at ?? null)}</dd>
+          <dt>Last modified</dt><dd>{diskDate(facts?.modified_at ?? null)}</dd>
+          <dt>Status</dt><dd>{selected.is_present ? 'Present' : 'No longer at this location'}</dd>
+        </dl></section>
+        <section className="panel history-panel"><h2>History <span>{events.length} events</span></h2>{events.length ? <ol className="timeline">{events.map((event, index) => <li key={`${event.at}-${index}`}><span className="timeline-dot"/><div><strong>{title(event.event_type)}</strong><time>{date(event.at)}</time>{event.old_path && <small>From {event.old_path}</small>}{event.new_path && event.new_path !== selected.path && <small>To {event.new_path}</small>}</div></li>)}</ol> : <p className="muted">No recorded changes yet.</p>}</section>
+      </> : <>
+        <div className="browser-heading"><h1>File history</h1><p>Find a file and see where it came from.</p></div>
+        <label className="search"><Search size={18}/><input autoFocus placeholder="Search name, path, or website" value={query} onChange={event => setQuery(event.target.value)}/>{query && <button aria-label="Clear search" onClick={() => setQuery('')}><X size={17}/></button>}</label>
+        <div className="list-heading">{query ? 'Search results' : 'Recent files'} <span>{files.length}</span></div>
+        <div className="file-list">{files.length ? files.map(file => <button className="file-row" key={file.id} onClick={() => setSelected(file)}><span className="row-icon"><File size={20}/></span><span className="row-text"><strong>{file.name}</strong><small>{file.source_domain || file.path}</small></span><span className="row-date">{date(file.first_seen_at)}</span><ArrowUpRight size={16}/></button>) : <div className="empty"><FolderOpen size={30}/><strong>{query ? 'No matching files' : 'No files recorded yet'}</strong><span>{query ? 'Try a filename or another search term.' : 'New files in watched folders will appear here.'}</span></div>}</div>
+      </>}
+    </main>
+    {error && <div className="error" role="alert" onClick={() => setError('')}>{error}<X size={15}/></div>}
   </div>;
 }

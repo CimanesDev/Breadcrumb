@@ -9,6 +9,23 @@ pub fn zone_identifier(path: &Path) -> (Option<String>, Option<String>, Option<S
     parse_zone_identifier(&text)
 }
 
+pub fn zone_label(path: &Path) -> Option<String> {
+    let stream = format!("{}:Zone.Identifier", path.display());
+    let text = std::fs::read_to_string(stream).ok()?;
+    let zone = text.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        key.trim().eq_ignore_ascii_case("ZoneId").then(|| value.trim().to_string())
+    })?;
+    Some(match zone.as_str() {
+        "0" => "Local computer",
+        "1" => "Local network",
+        "2" => "Trusted site",
+        "3" => "Internet",
+        "4" => "Restricted site",
+        _ => return None,
+    }.to_string())
+}
+
 pub fn parse_zone_identifier(text: &str) -> (Option<String>, Option<String>, Option<String>) {
     let mut host = None;
     let mut referrer = None;

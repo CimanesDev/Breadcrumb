@@ -10,6 +10,7 @@ use std::{path::Path, sync::{Arc, Mutex}};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WindowEvent};
+use serde::Serialize;
 
 pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
@@ -25,10 +26,47 @@ fn take_pending_path(state: tauri::State<AppState>) -> Option<String> {
 fn inspect_file(state: tauri::State<AppState>, path: String) -> Result<Option<database::FileRecord>, String> {
     let path = Path::new(&path);
     let mut db = state.db.lock().map_err(|e| e.to_string())?;
-    if path.is_file() && database::file_by_path(&db, path).map_err(|e| e.to_string())?.is_none() {
+    let existing = database::file_by_path(&db, path).map_err(|e| e.to_string())?;
+    if path.is_file() && existing.as_ref().is_none_or(|record| record.source_url.is_none()) {
         database::observe(&mut db, path).map_err(|e| e.to_string())?;
     }
     database::file_by_path(&db, path).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct FileFacts {
+    created_at: Option<u64>,
+    modified_at: Option<u64>,
+    file_type: String,
+    zone: Option<String>,
+}
+
+#[tauri::command]
+fn file_facts(path: String) -> FileFacts {
+    let path = Path::new(&path);
+    let metadata = std::fs::metadata(path).ok();
+    let timestamp = |value: Option<std::io::Result<std::time::SystemTime>>| {
+        value.and_then(Result::ok).and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration| duration.as_secs())
+    };
+    let file_type = path.extension().and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("{} file", value.to_uppercase()))
+        .unwrap_or_else(|| "File".to_string());
+    FileFacts {
+        created_at: timestamp(metadata.as_ref().map(|value| value.created())),
+        modified_at: timestamp(metadata.as_ref().map(|value| value.modified())),
+        file_type,
+        zone: provenance::zone_label(path),
+    }
+}
+
+#[tauri::command]
+fn show_in_explorer(path: String) -> Result<(), String> {
+    std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{path}"))
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 fn inspection_arg(args: &[String]) -> Option<String> {
@@ -145,6 +183,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             list_files,
             inspect_file,
+            file_facts,
+            show_in_explorer,
             take_pending_path,
             file_events,
             list_sources,

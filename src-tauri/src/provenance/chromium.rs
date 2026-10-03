@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -57,9 +57,10 @@ fn read_profile(history: &Path, path: &Path, size: u64) -> Option<DownloadMatch>
         }
     }
     let db = Connection::open_with_flags(copy, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    let mut stmt = db.prepare("SELECT id,target_path,total_bytes,start_time,tab_referrer_url FROM downloads ORDER BY start_time DESC LIMIT 300").ok()?;
+    let mut stmt = db.prepare("SELECT id,target_path,total_bytes,start_time,tab_referrer_url FROM downloads WHERE target_path=?1 COLLATE NOCASE OR start_time>=?2 ORDER BY (target_path=?1 COLLATE NOCASE) DESC,start_time DESC LIMIT 1000").ok()?;
+    let cutoff = (chrono::Utc::now().timestamp() - 86_400 + 11_644_473_600) * 1_000_000;
     let rows = stmt
-        .query_map([], |r| {
+        .query_map(params![path.to_string_lossy().as_ref(), cutoff], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -78,7 +79,7 @@ fn read_profile(history: &Path, path: &Path, size: u64) -> Option<DownloadMatch>
         let same_name = Path::new(&target).file_name() == path.file_name();
         let same_size = bytes >= 0 && bytes as u64 == size;
         let recent = (chrono::Utc::now().timestamp() - chromium_time(started)).abs() < 86_400;
-        let (score, confidence) = if exact_path && recent {
+        let (score, confidence) = if exact_path && same_size {
             (3, "high")
         } else if same_name && same_size && recent {
             (2, "medium")
@@ -126,13 +127,13 @@ mod tests {
     }
 
     #[test]
-    fn exact_path_matches_final_download_url() {
+    fn exact_historical_path_matches_final_download_url() {
         let temp = tempfile::tempdir().unwrap();
         let history = temp.path().join("History");
         let db = Connection::open(&history).unwrap();
         db.execute_batch("CREATE TABLE downloads(id INTEGER,target_path TEXT,total_bytes INTEGER,start_time INTEGER,tab_referrer_url TEXT); CREATE TABLE downloads_url_chains(id INTEGER,chain_index INTEGER,url TEXT);").unwrap();
         let target = temp.path().join("paper.pdf");
-        let now = (chrono::Utc::now().timestamp() + 11_644_473_600) * 1_000_000;
+        let now = (chrono::Utc::now().timestamp() - 30 * 86_400 + 11_644_473_600) * 1_000_000;
         db.execute(
             "INSERT INTO downloads VALUES(1,?1,42,?2,?3)",
             params![target.to_string_lossy(), now, "https://example.com/page"],

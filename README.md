@@ -10,7 +10,7 @@
 - Download URL, referrer, and domain from `Zone.Identifier` when Windows provides them
 - Best effort Chrome, Edge, and Brave download matching, including secondary profiles, using temporary read only copies of browser history
 - Search by filename, path, domain, or URL
-- File detail view with origin and history, plus a Sources view
+- Compact Explorer-style file inspector with origin evidence, original and current paths, disk dates, and a history timeline
 - Explorer file context menu: right-click a file and choose **Show file trail** (under **Show more options** on Windows 11) to open its details directly
 - Release builds start in the tray and register per-user startup so tracking resumes when you sign in
 - Local only operation, with no account, telemetry, or network upload
