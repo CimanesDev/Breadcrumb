@@ -1,0 +1,14 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+*.db
+*.db-wal
+*.db-shm
+*.log
+.env*
+*.tmp
+*.tsbuildinfo
+src-tauri/icons/android/
+src-tauri/icons/ios/
+src-tauri/icons/*.icns
