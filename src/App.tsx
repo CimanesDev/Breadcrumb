@@ -5,7 +5,7 @@ import { getCurrentWindow, LogicalSize } from '@tauri-apps/api/window';
 import { ArrowLeft, ArrowUpRight, File, FolderOpen, Search, X } from 'lucide-react';
 import './style.css';
 
-type FileRecord = { id:number; name:string; original_name:string; path:string; original_path:string; size_bytes:number; first_seen_at:string; last_seen_at:string; is_present:boolean; source_url:string|null; referrer_url:string|null; source_domain:string|null; browser_name:string|null; browser_profile:string|null; source_confidence:string|null };
+type FileRecord = { id:number; name:string; original_name:string; path:string; original_path:string; size_bytes:number; first_seen_at:string; last_seen_at:string; is_present:boolean; source_url:string|null; source_page_url:string|null; referrer_url:string|null; source_domain:string|null; browser_name:string|null; browser_profile:string|null; source_confidence:string|null };
 type FileEvent = { event_type:string; at:string; old_path:string|null; new_path:string|null };
 type FileFacts = { created_at:number|null; modified_at:number|null; file_type:string; zone:string|null };
 
@@ -50,6 +50,8 @@ export default function App() {
   }, [selected]);
 
   const openExplorer = () => selected && invoke('show_in_explorer', {path:selected.path}).catch(reason => setError(String(reason)));
+  const modelId = selected?.source_page_url?.match(/makerworld\.com\/[^/]+\/models\/(\d+)/i)?.[1];
+  const openAddress = (address:string) => invoke('open_source_url', {address}).catch(reason => setError(String(reason)));
 
   return <div className="app">
     <header className="topbar"><div className="brand"><span className="brand-mark">● · · ›</span><strong>Breadcrumb</strong></div><span className="topbar-label">File history</span></header>
@@ -57,12 +59,14 @@ export default function App() {
       {selected ? <>
         <div className="toolbar"><button className="text-button" onClick={() => {setSelected(null); setFacts(null);}}><ArrowLeft size={16}/> All files</button><button className="text-button" onClick={openExplorer}><FolderOpen size={16}/> Show in Explorer</button></div>
         <div className="identity"><div className="identity-icon"><File size={27}/></div><div className="identity-text"><h1 title={selected.name}>{selected.name}</h1><p title={selected.path}>{selected.path}</p></div></div>
-        <div className="summary"><span className="summary-label">File trail</span><strong>{selected.source_domain ? `From ${selected.source_domain}` : facts?.zone === 'Internet' ? 'From the internet' : 'Origin unknown'}</strong><span>{selected.source_url ? 'Download address recorded' : facts?.zone === 'Internet' ? 'Windows marked this file as downloaded; its address was not saved.' : 'Breadcrumb first saw this file at the location below.'}</span></div>
+        <div className="summary"><span className="summary-label">File trail</span><strong>{selected.source_domain ? `From ${selected.source_domain}` : facts?.zone === 'Internet' ? 'From the internet' : 'Origin unknown'}</strong><span>{selected.source_page_url ? 'Download page matched from browser history.' : selected.source_url ? 'A source address was saved for this file.' : facts?.zone === 'Internet' ? 'Windows marked this file as downloaded; its address was not saved.' : 'Breadcrumb first saw this file at the location below.'}</span></div>
         <section className="panel"><h2>Origin</h2><dl>
+          {modelId && <><dt>Model ID</dt><dd>{modelId}</dd></>}
+          {selected.source_page_url && <><dt>Download page</dt><dd className="path-value"><button className="address-button" onClick={() => openAddress(selected.source_page_url!)}>{selected.source_page_url} <ArrowUpRight size={13}/></button></dd></>}
           <dt>First seen</dt><dd>{date(selected.first_seen_at)}</dd>
           <dt>Original name</dt><dd>{selected.original_name}</dd>
           <dt>Original location</dt><dd className="path-value">{selected.original_path}</dd>
-          {selected.source_url && <><dt>Download URL</dt><dd className="path-value">{selected.source_url}</dd></>}
+          {selected.source_url && <><dt>File URL</dt><dd className="path-value">{selected.source_url}</dd></>}
           {selected.referrer_url && <><dt>Referrer</dt><dd className="path-value">{selected.referrer_url}</dd></>}
           {selected.browser_name && <><dt>Browser</dt><dd>{selected.browser_name}{selected.browser_profile ? ` · ${selected.browser_profile}` : ''}</dd></>}
           {facts?.zone && <><dt>Windows zone</dt><dd>{facts.zone}</dd></>}

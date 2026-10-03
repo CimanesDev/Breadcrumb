@@ -6,6 +6,7 @@ use std::{
 
 pub struct DownloadMatch {
     pub url: String,
+    pub page_url: Option<String>,
     pub referrer: Option<String>,
     pub domain: Option<String>,
     pub browser: String,
@@ -57,32 +58,41 @@ fn read_profile(history: &Path, path: &Path, size: u64) -> Option<DownloadMatch>
         }
     }
     let db = Connection::open_with_flags(copy, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
-    let mut stmt = db.prepare("SELECT id,target_path,total_bytes,start_time,tab_referrer_url FROM downloads WHERE target_path=?1 COLLATE NOCASE OR start_time>=?2 ORDER BY (target_path=?1 COLLATE NOCASE) DESC,start_time DESC LIMIT 1000").ok()?;
-    let cutoff = (chrono::Utc::now().timestamp() - 86_400 + 11_644_473_600) * 1_000_000;
+    let has_tab_url: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('downloads') WHERE name='tab_url')", [], |r| r.get(0)).ok()?;
+    let tab_column = if has_tab_url { "tab_url" } else { "NULL" };
+    let sql = format!("SELECT id,target_path,total_bytes,start_time,tab_referrer_url,{tab_column} FROM downloads WHERE target_path=?1 COLLATE NOCASE OR total_bytes=?2 ORDER BY (target_path=?1 COLLATE NOCASE) DESC,start_time DESC LIMIT 5000");
+    let mut stmt = db.prepare(&sql).ok()?;
+    let modified_at = fs::metadata(path).ok().and_then(|meta| meta.modified().ok()).and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok()).map(|duration| duration.as_secs() as i64);
     let rows = stmt
-        .query_map(params![path.to_string_lossy().as_ref(), cutoff], |r| {
+        .query_map(params![path.to_string_lossy().as_ref(), size as i64], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
                 r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
             ))
         })
         .ok()?;
     let mut best: Option<(i32, DownloadMatch)> = None;
     for row in rows.flatten() {
-        let (id, target, bytes, started, referrer) = row;
+        let (id, target, bytes, started, referrer, page_url) = row;
         let exact_path = Path::new(&target)
             .to_string_lossy()
             .eq_ignore_ascii_case(&path.to_string_lossy());
-        let same_name = Path::new(&target).file_name() == path.file_name();
+        let same_name = Path::new(&target).file_name().and_then(|name| name.to_str())
+            .zip(path.file_name().and_then(|name| name.to_str()))
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right));
         let same_size = bytes >= 0 && bytes as u64 == size;
         let recent = (chrono::Utc::now().timestamp() - chromium_time(started)).abs() < 86_400;
+        let modified_near_download = modified_at.is_some_and(|at| (at - chromium_time(started)).abs() < 600);
         let (score, confidence) = if exact_path && same_size {
             (3, "high")
-        } else if same_name && same_size && recent {
+        } else if same_name && same_size && modified_near_download {
             (2, "medium")
+        } else if same_name && same_size && recent {
+            (1, "medium")
         } else {
             continue;
         };
@@ -93,14 +103,16 @@ fn read_profile(history: &Path, path: &Path, size: u64) -> Option<DownloadMatch>
         ) else {
             continue;
         };
-        let domain = url::Url::parse(&url)
-            .ok()
-            .and_then(|v| v.host_str().map(str::to_string));
+        let page_url = page_url.filter(|value| url::Url::parse(value).ok().is_some_and(|url| matches!(url.scheme(), "http" | "https")));
+        let domain = page_url.as_ref().and_then(|value| url::Url::parse(value).ok())
+            .or_else(|| url::Url::parse(&url).ok())
+            .and_then(|value| value.host_str().map(str::to_string));
         if domain.is_none() {
             continue;
         }
         let found = DownloadMatch {
             url,
+            page_url,
             referrer: referrer.filter(|v| !v.is_empty()),
             domain,
             browser: String::new(),
@@ -121,6 +133,7 @@ fn read_profile(history: &Path, path: &Path, size: u64) -> Option<DownloadMatch>
 mod tests {
     use super::{chromium_time, read_profile};
     use rusqlite::{params, Connection};
+    use std::fs;
     #[test]
     fn converts_chromium_epoch() {
         assert_eq!(chromium_time(11_644_473_600_000_000), 0);
@@ -154,5 +167,23 @@ mod tests {
         assert_eq!(found.url, "https://cdn.example.com/paper.pdf");
         assert_eq!(found.domain.as_deref(), Some("cdn.example.com"));
         assert_eq!(found.confidence, "high");
+    }
+
+    #[test]
+    fn moved_download_recovers_original_model_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("model.obj");
+        fs::write(&file, b"model").unwrap();
+        let history = temp.path().join("History");
+        let db = Connection::open(&history).unwrap();
+        db.execute_batch("CREATE TABLE downloads(id INTEGER,target_path TEXT,total_bytes INTEGER,start_time INTEGER,tab_referrer_url TEXT,tab_url TEXT); CREATE TABLE downloads_url_chains(id INTEGER,chain_index INTEGER,url TEXT);").unwrap();
+        let now = (chrono::Utc::now().timestamp() + 11_644_473_600) * 1_000_000;
+        let page = "https://makerworld.com/en/models/1506386-example#profileId-1585920";
+        db.execute("INSERT INTO downloads VALUES(1,'C:\\Downloads\\model.obj',5,?1,NULL,?2)", params![now, page]).unwrap();
+        db.execute("INSERT INTO downloads_url_chains VALUES(1,0,'https://cdn.example.com/model.obj')", []).unwrap();
+        drop(db);
+        let found = read_profile(&history, &file, 5).unwrap();
+        assert_eq!(found.page_url.as_deref(), Some(page));
+        assert_eq!(found.confidence, "medium");
     }
 }

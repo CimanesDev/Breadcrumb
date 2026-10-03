@@ -9,6 +9,7 @@
 - Persistent SQLite history in `%LOCALAPPDATA%\Breadcrumb\history.db`
 - Download URL, referrer, and domain from `Zone.Identifier` when Windows provides them
 - Best effort Chrome, Edge, and Brave download matching, including secondary profiles, using temporary read only copies of browser history
+- Browser download-page recovery when the original file was moved but its name, size, and modification time still match; model IDs are shown for MakerWorld pages
 - Search by filename, path, domain, or URL
 - Compact Explorer-style file inspector with origin evidence, original and current paths, disk dates, and a history timeline
 - Explorer file context menu: right-click a file and choose **Show file trail** (under **Show more options** on Windows 11) to open its details directly

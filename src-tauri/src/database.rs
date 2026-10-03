@@ -14,6 +14,7 @@ pub struct FileRecord {
     pub last_seen_at: String,
     pub is_present: bool,
     pub source_url: Option<String>,
+    pub source_page_url: Option<String>,
     pub referrer_url: Option<String>,
     pub source_domain: Option<String>,
     pub browser_name: Option<String>,
@@ -72,10 +73,26 @@ pub fn open() -> Result<Connection> {
     if !has_key {
         db.execute_batch(include_str!("../migrations/003_identity.sql"))?;
     }
+    let has_page: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('files') WHERE name='source_page_url')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_page {
+        db.execute_batch(include_str!("../migrations/004_source_page.sql"))?;
+    }
     Ok(db)
 }
 
 pub fn observe(db: &mut Connection, path: &Path) -> Result<()> {
+    observe_inner(db, path, false)
+}
+
+pub fn enrich(db: &mut Connection, path: &Path) -> Result<()> {
+    observe_inner(db, path, true)
+}
+
+fn observe_inner(db: &mut Connection, path: &Path, force_browser: bool) -> Result<()> {
     let Ok(meta) = fs::metadata(path) else {
         return Ok(());
     };
@@ -89,14 +106,15 @@ pub fn observe(db: &mut Connection, path: &Path) -> Result<()> {
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let already_sourced: bool = db
+    let (already_sourced, already_has_page): (bool, bool) = db
         .query_row(
-            "SELECT source_url IS NOT NULL FROM files WHERE current_path=?1",
+            "SELECT source_url IS NOT NULL,source_page_url IS NOT NULL FROM files WHERE current_path=?1",
             [&path_text],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .unwrap_or(false);
+        .unwrap_or((false, false));
     let (mut url, mut referrer, mut domain) = crate::provenance::zone_identifier(path);
+    let mut page_url = None;
     let mut browser_name = None;
     let mut browser_profile = None;
     let mut confidence = if url.is_some() {
@@ -104,8 +122,9 @@ pub fn observe(db: &mut Connection, path: &Path) -> Result<()> {
     } else {
         None
     };
-    if !already_sourced {
+    if !already_has_page && (force_browser || !already_sourced) {
         if let Some(found) = crate::provenance::chromium::match_download(path, meta.len()) {
+            page_url = found.page_url;
             if url.is_none() {
                 url = Some(found.url);
                 referrer = found.referrer;
@@ -113,22 +132,22 @@ pub fn observe(db: &mut Connection, path: &Path) -> Result<()> {
                 browser_name = Some(found.browser);
                 browser_profile = Some(found.profile);
                 confidence = Some(found.confidence);
-            } else if found.confidence == "high" {
+            } else {
                 browser_name = Some(found.browser);
                 browser_profile = Some(found.profile);
             }
         }
     }
     let tx = db.transaction()?;
-    let existing: Option<(i64, bool, bool)> = tx
+    let existing: Option<(i64, bool, bool, bool)> = tx
         .query_row(
-            "SELECT id,is_present,source_url IS NOT NULL FROM files WHERE current_path=?1",
+            "SELECT id,is_present,source_url IS NOT NULL,source_page_url IS NOT NULL FROM files WHERE current_path=?1",
             [&path_text],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .ok();
-    if let Some((id, was_present, had_source)) = existing {
-        tx.execute("UPDATE files SET size_bytes=?1,last_seen_at=datetime('now'),is_present=1,deleted_at=NULL,source_url=COALESCE(source_url,?2),referrer_url=COALESCE(referrer_url,?3),source_domain=COALESCE(source_domain,?4),browser_name=COALESCE(browser_name,?5),browser_profile=COALESCE(browser_profile,?6),source_confidence=COALESCE(source_confidence,?7),file_key=COALESCE(file_key,?8) WHERE id=?9", params![meta.len() as i64,url,referrer,domain,browser_name,browser_profile,confidence,file_key,id])?;
+    if let Some((id, was_present, had_source, had_page)) = existing {
+        tx.execute("UPDATE files SET size_bytes=?1,last_seen_at=datetime('now'),is_present=1,deleted_at=NULL,source_url=COALESCE(source_url,?2),referrer_url=COALESCE(referrer_url,?3),source_domain=COALESCE(source_domain,?4),browser_name=COALESCE(browser_name,?5),browser_profile=COALESCE(browser_profile,?6),source_confidence=COALESCE(source_confidence,?7),file_key=COALESCE(file_key,?8),source_page_url=COALESCE(source_page_url,?9) WHERE id=?10", params![meta.len() as i64,url,referrer,domain,browser_name,browser_profile,confidence,file_key,page_url,id])?;
         if !was_present {
             tx.execute(
                 "INSERT INTO file_events(file_id,event_type,new_path) VALUES (?1,'RESTORED',?2)",
@@ -138,6 +157,9 @@ pub fn observe(db: &mut Connection, path: &Path) -> Result<()> {
         if !had_source && url.is_some() {
             tx.execute("INSERT INTO file_events(file_id,event_type,new_path) VALUES (?1,'SOURCE_IDENTIFIED',?2)",params![id,path_text])?;
         }
+        if !had_page && page_url.is_some() {
+            tx.execute("INSERT INTO file_events(file_id,event_type,new_path) VALUES (?1,'SOURCE_PAGE_IDENTIFIED',?2)",params![id,path_text])?;
+        }
     } else {
         let moved = if let Some(ref key) = file_key {
             tx.query_row("SELECT id,current_path FROM files WHERE file_key=?1 AND current_path<>?2 AND last_seen_at>=datetime('now','-1 minute') ORDER BY last_seen_at DESC LIMIT 1",params![key,path_text],|r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).ok()
@@ -146,11 +168,11 @@ pub fn observe(db: &mut Connection, path: &Path) -> Result<()> {
             None
         };
         if let Some((id, old_path)) = moved {
-            tx.execute("UPDATE files SET current_name=?1,current_path=?2,size_bytes=?3,last_seen_at=datetime('now'),is_present=1,deleted_at=NULL,source_url=COALESCE(source_url,?4),referrer_url=COALESCE(referrer_url,?5),source_domain=COALESCE(source_domain,?6),browser_name=COALESCE(browser_name,?7),browser_profile=COALESCE(browser_profile,?8),source_confidence=COALESCE(source_confidence,?9) WHERE id=?10",params![name,path_text,meta.len() as i64,url,referrer,domain,browser_name,browser_profile,confidence,id])?;
+            tx.execute("UPDATE files SET current_name=?1,current_path=?2,size_bytes=?3,last_seen_at=datetime('now'),is_present=1,deleted_at=NULL,source_url=COALESCE(source_url,?4),referrer_url=COALESCE(referrer_url,?5),source_domain=COALESCE(source_domain,?6),browser_name=COALESCE(browser_name,?7),browser_profile=COALESCE(browser_profile,?8),source_confidence=COALESCE(source_confidence,?9),source_page_url=COALESCE(source_page_url,?10) WHERE id=?11",params![name,path_text,meta.len() as i64,url,referrer,domain,browser_name,browser_profile,confidence,page_url,id])?;
             tx.execute("DELETE FROM file_events WHERE id=(SELECT id FROM file_events WHERE file_id=?1 AND event_type='DELETED' ORDER BY id DESC LIMIT 1)", [id])?;
             tx.execute("INSERT INTO file_events(file_id,event_type,old_path,new_path) VALUES (?1,'MOVED',?2,?3)",params![id,old_path,path_text])?;
         } else {
-            tx.execute("INSERT INTO files (current_name,original_name,current_path,original_path,size_bytes,source_url,referrer_url,source_domain,browser_name,browser_profile,source_confidence,file_key) VALUES (?1,?1,?2,?2,?3,?4,?5,?6,?7,?8,?9,?10)",params![name,path_text,meta.len() as i64,url,referrer,domain,browser_name,browser_profile,confidence,file_key])?;
+            tx.execute("INSERT INTO files (current_name,original_name,current_path,original_path,size_bytes,source_url,referrer_url,source_domain,browser_name,browser_profile,source_confidence,file_key,source_page_url) VALUES (?1,?1,?2,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",params![name,path_text,meta.len() as i64,url,referrer,domain,browser_name,browser_profile,confidence,file_key,page_url])?;
             let id = tx.last_insert_rowid();
             tx.execute(
                 "INSERT INTO file_events(file_id,event_type,new_path) VALUES (?1,?2,?3)",
@@ -250,7 +272,7 @@ pub fn rename(db: &mut Connection, old: &Path, new: &Path) -> Result<()> {
 
 pub fn list_files(db: &Connection, query: &str) -> Result<Vec<FileRecord>> {
     let q = format!("%{}%", query.replace('%', "\\%").replace('_', "\\_"));
-    let mut stmt = db.prepare("SELECT id,current_name,original_name,current_path,original_path,size_bytes,first_seen_at,last_seen_at,is_present,source_url,referrer_url,source_domain,browser_name,browser_profile,source_confidence FROM files WHERE current_name LIKE ?1 ESCAPE '\\' OR original_name LIKE ?1 ESCAPE '\\' OR current_path LIKE ?1 ESCAPE '\\' OR original_path LIKE ?1 ESCAPE '\\' OR source_domain LIKE ?1 ESCAPE '\\' OR source_url LIKE ?1 ESCAPE '\\' OR browser_name LIKE ?1 ESCAPE '\\' OR id IN (SELECT file_id FROM file_events WHERE old_path LIKE ?1 ESCAPE '\\' OR new_path LIKE ?1 ESCAPE '\\') ORDER BY last_seen_at DESC LIMIT 200")?;
+    let mut stmt = db.prepare("SELECT id,current_name,original_name,current_path,original_path,size_bytes,first_seen_at,last_seen_at,is_present,source_url,referrer_url,source_domain,browser_name,browser_profile,source_confidence,source_page_url FROM files WHERE current_name LIKE ?1 ESCAPE '\\' OR original_name LIKE ?1 ESCAPE '\\' OR current_path LIKE ?1 ESCAPE '\\' OR original_path LIKE ?1 ESCAPE '\\' OR source_domain LIKE ?1 ESCAPE '\\' OR source_url LIKE ?1 ESCAPE '\\' OR source_page_url LIKE ?1 ESCAPE '\\' OR browser_name LIKE ?1 ESCAPE '\\' OR id IN (SELECT file_id FROM file_events WHERE old_path LIKE ?1 ESCAPE '\\' OR new_path LIKE ?1 ESCAPE '\\') ORDER BY last_seen_at DESC LIMIT 200")?;
     let rows = stmt.query_map([q], |r| {
         Ok(FileRecord {
             id: r.get(0)?,
@@ -268,6 +290,7 @@ pub fn list_files(db: &Connection, query: &str) -> Result<Vec<FileRecord>> {
             browser_name: r.get(12)?,
             browser_profile: r.get(13)?,
             source_confidence: r.get(14)?,
+            source_page_url: r.get(15)?,
         })
     })?;
     rows.collect()
@@ -275,7 +298,7 @@ pub fn list_files(db: &Connection, query: &str) -> Result<Vec<FileRecord>> {
 
 pub fn file_by_path(db: &Connection, path: &Path) -> Result<Option<FileRecord>> {
     let path_text = path.to_string_lossy();
-    let mut stmt = db.prepare("SELECT id,current_name,original_name,current_path,original_path,size_bytes,first_seen_at,last_seen_at,is_present,source_url,referrer_url,source_domain,browser_name,browser_profile,source_confidence FROM files WHERE current_path=?1 COLLATE NOCASE OR original_path=?1 COLLATE NOCASE ORDER BY (current_path=?1 COLLATE NOCASE) DESC,last_seen_at DESC LIMIT 1")?;
+    let mut stmt = db.prepare("SELECT id,current_name,original_name,current_path,original_path,size_bytes,first_seen_at,last_seen_at,is_present,source_url,referrer_url,source_domain,browser_name,browser_profile,source_confidence,source_page_url FROM files WHERE current_path=?1 COLLATE NOCASE OR original_path=?1 COLLATE NOCASE ORDER BY (current_path=?1 COLLATE NOCASE) DESC,last_seen_at DESC LIMIT 1")?;
     let mut rows = stmt.query([path_text.as_ref()])?;
     if let Some(r) = rows.next()? {
         Ok(Some(FileRecord {
@@ -284,6 +307,7 @@ pub fn file_by_path(db: &Connection, path: &Path) -> Result<Option<FileRecord>> 
             first_seen_at: r.get(6)?, last_seen_at: r.get(7)?, is_present: r.get(8)?,
             source_url: r.get(9)?, referrer_url: r.get(10)?, source_domain: r.get(11)?,
             browser_name: r.get(12)?, browser_profile: r.get(13)?, source_confidence: r.get(14)?,
+            source_page_url: r.get(15)?,
         }))
     } else {
         Ok(None)
@@ -350,6 +374,8 @@ mod tests {
             .unwrap();
         db.execute_batch(include_str!("../migrations/003_identity.sql"))
             .unwrap();
+        db.execute_batch(include_str!("../migrations/004_source_page.sql"))
+            .unwrap();
         observe(&mut db, &first).unwrap();
         let renamed = temp.path().join("renamed.pdf");
         fs::rename(&first, &renamed).unwrap();
@@ -387,6 +413,8 @@ mod tests {
             .unwrap();
         db.execute_batch(include_str!("../migrations/003_identity.sql"))
             .unwrap();
+        db.execute_batch(include_str!("../migrations/004_source_page.sql"))
+            .unwrap();
         observe(&mut db, &child).unwrap();
         let new_dir = temp.path().join("new");
         fs::rename(&old_dir, &new_dir).unwrap();
@@ -410,6 +438,8 @@ mod tests {
         db.execute_batch(include_str!("../migrations/002_browser.sql"))
             .unwrap();
         db.execute_batch(include_str!("../migrations/003_identity.sql"))
+            .unwrap();
+        db.execute_batch(include_str!("../migrations/004_source_page.sql"))
             .unwrap();
         observe(&mut db, &old).unwrap();
         let new = folder.join("old.txt");

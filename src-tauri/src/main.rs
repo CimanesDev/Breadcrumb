@@ -27,8 +27,8 @@ fn inspect_file(state: tauri::State<AppState>, path: String) -> Result<Option<da
     let path = Path::new(&path);
     let mut db = state.db.lock().map_err(|e| e.to_string())?;
     let existing = database::file_by_path(&db, path).map_err(|e| e.to_string())?;
-    if path.is_file() && existing.as_ref().is_none_or(|record| record.source_url.is_none()) {
-        database::observe(&mut db, path).map_err(|e| e.to_string())?;
+    if path.is_file() && existing.as_ref().is_none_or(|record| record.source_page_url.is_none()) {
+        database::enrich(&mut db, path).map_err(|e| e.to_string())?;
     }
     database::file_by_path(&db, path).map_err(|e| e.to_string())
 }
@@ -64,6 +64,19 @@ fn file_facts(path: String) -> FileFacts {
 fn show_in_explorer(path: String) -> Result<(), String> {
     std::process::Command::new("explorer.exe")
         .arg(format!("/select,{path}"))
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn open_source_url(address: String) -> Result<(), String> {
+    let parsed = url::Url::parse(&address).map_err(|error| error.to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Only web addresses can be opened".to_string());
+    }
+    std::process::Command::new("explorer.exe")
+        .arg(address)
         .spawn()
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -185,6 +198,7 @@ fn main() {
             inspect_file,
             file_facts,
             show_in_explorer,
+            open_source_url,
             take_pending_path,
             file_events,
             list_sources,
